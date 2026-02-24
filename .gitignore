@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# AI Models & Data (Large files)
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.bin
+*.pt
+*.pth
+*.onnx
+*.safetensors
+models/
+library/*/
+training_data/*/
+
+# System
+.DS_Store
+Thumbs.db
+ffmpeg.zip
+temp_*
+
+# Frontend (React)
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.env*
