@@ -148,3 +148,19 @@ async def generate_mc_voice(text: str = Form(...)):
 @app.get("/")
 def read_root():
     return {"message": "Hello Trung! MC Hub AI Service is running with TTS & STT support!"}
+
+
+# ================================================================
+#  Entry point — bypass Python 3.13 signal handling bug on Windows
+#  Chạy bằng: python main.py
+# ================================================================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "main:app",
+        host="127.0.0.1",
+        port=8000,
+        reload=True,
+        loop="asyncio",       # Fix lỗi signal.raise_signal trên Python 3.13 Windows
+        log_level="info",
+    )
