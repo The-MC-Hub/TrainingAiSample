@@ -1,10 +1,38 @@
+# Core API
 fastapi
 uvicorn
 python-multipart
+
+# AI Models
 openai-whisper
-jiwer
-torch
-numpy
 transformers
-scipy
+accelerate
+
+# Audio Processing
+librosa
 soundfile
+scipy
+numpy
+
+# Evaluation
+jiwer
+
+# Dataset Download (HuggingFace)
+datasets
+huggingface_hub
+
+# Progress bars
+tqdm
+
+# FFmpeg bridge (Windows)
+static-ffmpeg
+
+# ----------------------------------------------------------------
+# NOTE: Install PyTorch WITH CUDA support separately:
+#
+# For CUDA 12.1 (RTX 4060):
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+#
+# Verify GPU after install:
+#   python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+# ----------------------------------------------------------------
