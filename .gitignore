@@ -5,7 +5,7 @@ __pycache__/
 venv/
 .env
 
-# AI Models & Data (Large files)
+# AI Models & large binary weights
 *.wav
 *.mp3
 *.m4a
@@ -13,20 +13,20 @@ venv/
 *.bin
 *.pt
 *.pth
+*.ckpt
 *.onnx
 *.safetensors
 models/
-library/*/
-training_data/*/
+library/
+training_data/
+
+# GPT-SoVITS submodule (10GB+ — clone separately)
+GPT-SoVITS/
+
+# Temp files
+temp_*
+mc_voice_output.wav
 
 # System
 .DS_Store
 Thumbs.db
-ffmpeg.zip
-temp_*
-
-# Frontend (React)
-frontend/node_modules/
-frontend/dist/
-frontend/.vite/
-frontend/.env*
