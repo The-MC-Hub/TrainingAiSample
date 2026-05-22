@@ -240,35 +240,196 @@ Falls back to simple mean when no criteria provided.
 
 ```
 TrainingAiSample/
-├── main.py               # FastAPI server — all analysis + TTS endpoints
-├── download_model.py     # Downloads facebook/mms-tts-vie to ./models/
-├── fetch_samples.py      # Downloads MC voice reference samples to ./library/
-├── preprocess_audio.py   # Preprocesses raw audio for TTS/STT fine-tuning
-├── requirement.txt       # Python dependencies
-├── .env                  # Local config (WHISPER_MODEL_SIZE, CORS origins, etc.)
-├── .gitignore            # Excludes models/, library/, training_data/, __pycache__/
 │
-├── models/               # Downloaded TTS model (auto-generated, gitignored)
-│   └── mms-tts-vie/
-│       ├── config.json
-│       ├── model.safetensors
-│       └── tokenizer_config.json
+├── ── API Service ──────────────────────────────────────────────────
 │
-├── library/              # Reference MC voice samples (gitignored)
-│   ├── MC_Nam_MienBac_VIVOS/
-│   ├── MC_Nu_MienNam_CodeLink/
-│   └── ...
+├── main.py
+│   FastAPI server — the production AI service. Loaded at startup:
+│   Whisper small (STT) and facebook/mms-tts-vie (TTS) on CUDA.
+│   Contains all helper functions and two endpoints:
+│     POST /analyze-voice  — full pipeline: STT → scoring → evaluation
+│     POST /generate-mc-voice — Vietnamese TTS synthesis
+│     GET  /              — health check (device, GPU, model status)
+│   Internal helpers:
+│     compute_pause_stats()       — RMS silence detection, ≥150ms pauses
+│     compute_pacing_score()      — WPM vs target range, 0–100 output
+│     compute_criteria_scores()   — maps PRONUNCIATION/RHYTHM/PACING/EMOTION
+│     compute_overall_score()     — weighted average of criteria scores
+│     generate_bilingual_evaluation() — builds VI+EN feedback/tips/report
+│   CORS: allows localhost:3000, localhost:5173 (dev frontend ports)
+│   Port: 8000 (uvicorn) or 8001 (python main.py __main__)
 │
-├── training_data/        # Preprocessed audio for fine-tuning (gitignored)
-│   ├── metadata_master.txt
-│   ├── tts_wavs/         # 22050Hz normalized WAVs for GPT-SoVITS
-│   ├── stt_wavs/         # 16000Hz WAVs for Whisper fine-tune
-│   ├── tts_metadata.txt
-│   └── stt_metadata.txt
+├── requirement.txt
+│   Python dependencies. Groups:
+│     Core API     → fastapi, uvicorn, python-multipart
+│     AI Models    → openai-whisper, transformers, accelerate
+│     Audio        → librosa, soundfile, scipy, numpy
+│     Evaluation   → jiwer (WER scoring)
+│     Datasets     → datasets, huggingface_hub
+│     Utilities    → tqdm, static-ffmpeg (Windows FFmpeg bridge)
+│   NOTE: PyTorch must be installed separately with CUDA index URL
+│         (see Getting Started section)
+│
+├── .env
+│   Local environment config — never committed (gitignored).
+│   Variables: WHISPER_MODEL_SIZE, TTS_MODEL_PATH, ALLOWED_ORIGINS,
+│   HOST, PORT. CORS origins currently hardcoded in main.py lines 27–35;
+│   .env values reserved for future python-dotenv migration.
+│
+├── .gitignore
+│   Excludes: models/, library/, training_data/, GPT-SoVITS/,
+│   __pycache__/, venv/, .env, all audio formats (*.wav *.mp3 *.m4a
+│   *.flac), model weights (*.bin *.pt *.pth *.ckpt *.onnx
+│   *.safetensors), temp files (temp_*, mc_voice_output.wav)
+│
+│
+├── ── Model Bootstrap ──────────────────────────────────────────────
+│
+├── download_model.py
+│   One-time setup: downloads facebook/mms-tts-vie from HuggingFace
+│   and saves model + tokenizer to ./models/mms-tts-vie/.
+│   Run once before starting the server. Uses transformers
+│   VitsModel.from_pretrained() + AutoTokenizer.from_pretrained().
+│   Output: config.json, model.safetensors, tokenizer_config.json
+│
+│
+├── ── Data Pipeline ────────────────────────────────────────────────
+│
+├── download_dataset.py  (v5 — VERIFIED WORKING)
+│   Interactive dataset downloader. Menu-driven (5 options):
+│     1. VietSuperSpeech 2000 samples  (~20 min)
+│     2. VietSuperSpeech FULL 267h     (hours)
+│     3. VIVOS via OpenSLR             (~1.5 GB zip)
+│     4. Both VIVOS + VSS 2000         (recommended for STT+TTS)
+│     5. Quick test 200 samples        (~3 min)
+│   Functions:
+│     download_vietsuperspeech(max_samples) — streams HuggingFace
+│       dataset thanhnew2001/VietSuperSpeech, downloads each WAV
+│       via hf_hub_download, resamples to 16kHz with librosa,
+│       writes library/vietsuperspeech/vss_XXXXXX.wav
+│     download_vivos_openslr() — urllib downloads vivos.zip from
+│       openslr.org/101, extracts, parses prompts.txt → metadata
+│     merge_metadata() — scans all library/*/metadata.txt files,
+│       merges into training_data/metadata_master.txt
+│   Output metadata format (pipe-delimited):
+│     library/vietsuperspeech/vss_000000.wav|VSS_SPK|vi|transcript
+│
+├── preprocess_audio.py  (v2)
+│   Reads training_data/metadata_master.txt and produces two clean
+│   datasets for separate model fine-tuning:
+│   TTS branch → training_data/tts_wavs/  (for GPT-SoVITS)
+│     - Resample to 22050Hz (GPT-SoVITS requirement)
+│     - Peak normalize to −3 dBFS
+│     - Save as PCM 16-bit WAV
+│   STT branch → training_data/stt_wavs/  (for Whisper fine-tune)
+│     - Resample to 16000Hz (Whisper requirement)
+│     - Save as PCM 16-bit WAV
+│   Filters: skip if duration < 1s (too short) or > 15s (noisy)
+│   Outputs: tts_metadata.txt and stt_metadata.txt
+│   Prints summary: Input / TTS out / STT out / Skipped / Errors
+│
+│
+├── ── Fine-Tuning Scripts ──────────────────────────────────────────
+│
+├── finetune_whisper.py
+│   Fine-tunes Whisper small on Vietnamese speech to improve STT
+│   accuracy for MC-style audio (regional accents, event scripts).
+│   Input:  training_data/stt_metadata.txt (wav_path|transcript)
+│   Output: models/whisper-vi-finetuned/ (full model + processor)
+│   Config (optimized for RTX 4060 8GB):
+│     MODEL_NAME    = openai/whisper-small
+│     BATCH_SIZE    = 4  (safe for 8GB VRAM)
+│     GRAD_ACCUM    = 4  → effective batch 16
+│     MAX_STEPS     = 1000  (~30 min on RTX 4060 with 2000 samples)
+│     LEARNING_RATE = 1e-5
+│     fp16 = True (FP16 training on CUDA)
+│   Uses HuggingFace Seq2SeqTrainer + WER metric (evaluate lib).
+│   Data collator: WhisperDataCollator pads inputs + masks labels.
+│   After training: update main.py to load from models/whisper-vi-finetuned/
+│
+├── launch_sovits_training.py
+│   Pre-flight launcher for GPT-SoVITS WebUI TTS training.
+│   Run AFTER finetune_whisper.py completes.
+│   Steps:
+│     1. check_prereqs() — verifies GPT-SoVITS dir exists, counts
+│        TTS WAVs in training_data/tts_wavs/, checks tts_metadata.txt
+│     2. create_sovits_config() — writes models/gpt-sovits-vi/
+│        training_config.json with pretrained model paths, batch=4,
+│        epochs=8, language=vi, experiment name=MC_Hub_Vietnamese
+│     3. launch_webui() — chdir to GPT-SoVITS/, sets
+│        CUDA_VISIBLE_DEVICES=0, runs webui.py
+│   Prints browser URL (http://localhost:9872) and WebUI instructions.
+│   Input:  training_data/tts_wavs/ + training_data/tts_metadata.txt
+│   Output: models/gpt-sovits-vi/ (config + trained weights)
+│
+├── run_sovits_training.py
+│   Lower-level GPT-SoVITS pipeline runner (Phase 5).
+│   Directly orchestrates the 3 feature extraction steps via subprocess
+│   instead of going through the WebUI.
+│   Steps:
+│     1. Validate: checks VENV_PYTHON, metadata, WAV count
+│     2. Build annotation: reads metadata_master.txt, copies up to
+│        1000 WAVs into GPT-SoVITS/logs/mc_vi_voice/0_gt_wavs/,
+│        writes ann.list in format: wav_path|speaker|vi|text
+│     3. Run prepare_datasets/1-get-text.py  — text + BERT features
+│     4. Run prepare_datasets/2-get-hubert-wav32k.py — HuBERT SSL features
+│     5. Run prepare_datasets/3-get-semantic.py — semantic token extraction
+│   After preprocessing done: instructs user to launch webui.py manually.
+│   Difference from launch_sovits_training.py:
+│     - launch_sovits_training.py = WebUI launcher (recommended, easier)
+│     - run_sovits_training.py = headless CLI pipeline (advanced, direct)
+│
+│
+├── ── Documentation ────────────────────────────────────────────────
 │
 ├── README.md
-├── AI_ANALYSIS_WORKFLOW.md   # Deep-dive: FFT → Mel → Whisper → WER → Feedback
-└── FINETUNE_GUIDE.md         # GPT-SoVITS fine-tuning workflow
+│   This file. Full technical reference for the AI service.
+│
+├── AI_ANALYSIS_WORKFLOW.md
+│   13-stage deep-dive into how the analysis pipeline works:
+│   audio physics → FFT → Mel spectrogram → Whisper encoder/decoder →
+│   WER scoring → rhythm (onset_strength std) → pacing (WPM formula) →
+│   pause detection (RMS silence) → criteria scoring → bilingual
+│   evaluation → end-to-end example with numeric values.
+│
+└── FINETUNE_GUIDE.md
+    4-phase professional guide for training a custom Vietnamese MC voice:
+    Phase 1 (collect audio) → Phase 2 (preprocess) →
+    Phase 3 (GPT-SoVITS fine-tune) → Phase 4 (deploy to main.py).
+    Includes hardware requirements, recording guidelines, WebUI
+    config for RTX 4060, timing estimates, and troubleshooting.
+```
+
+### Generated directories (gitignored — not in repo)
+
+```
+models/
+├── mms-tts-vie/            ← download_model.py output
+│   ├── config.json
+│   ├── model.safetensors
+│   └── tokenizer_config.json
+├── whisper-vi-finetuned/   ← finetune_whisper.py output
+└── gpt-sovits-vi/          ← launch_sovits_training.py output
+    └── training_config.json
+
+library/
+├── vietsuperspeech/        ← download_dataset.py (VSS option)
+│   ├── vss_000000.wav
+│   ├── ...
+│   └── metadata.txt
+└── vivos/                  ← download_dataset.py (VIVOS option)
+    └── vivos/
+        ├── train/waves/
+        └── test/waves/
+
+training_data/
+├── metadata_master.txt     ← merged by download_dataset.py
+├── tts_wavs/               ← 22050Hz WAVs for GPT-SoVITS
+├── stt_wavs/               ← 16000Hz WAVs for Whisper
+├── tts_metadata.txt        ← preprocess_audio.py output
+└── stt_metadata.txt        ← preprocess_audio.py output
+
+GPT-SoVITS/                 ← clone separately (~10 GB)
 ```
 
 ---

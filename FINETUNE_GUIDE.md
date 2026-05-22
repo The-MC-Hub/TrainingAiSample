@@ -1,7 +1,41 @@
 # Fine-Tuning Guide — MC Voice (GPT-SoVITS)
 
 > Hướng dẫn huấn luyện giọng nói MC tiêu chuẩn từ dữ liệu thực.  
-> Target hardware: RTX 4060 8GB / Windows 11. Training time: ~30 min per epoch.
+> Target hardware: RTX 4060 8GB / Windows 11. Training time: ~30 min per epoch.  
+> **Last updated:** 2026-05-22
+
+---
+
+## Quick-Start Checklist
+
+Run through this checklist before starting. Missing any item will cause failure later.
+
+**Hardware & Environment**
+- [ ] NVIDIA GPU with CUDA 12.1+ installed (`nvidia-smi` returns without error)
+- [ ] Python 3.9–3.10 installed (`python --version`)
+- [ ] 20+ GB free disk space (`dir` or `df -h`)
+- [ ] FFmpeg installed (`ffmpeg -version`) — OR `static-ffmpeg` handles it automatically for the API
+
+**Dependencies**
+- [ ] PyTorch with CUDA installed: `pip install torch --index-url https://download.pytorch.org/whl/cu121`
+- [ ] All requirements installed: `pip install -r requirement.txt`
+- [ ] TTS model downloaded: `python download_model.py`
+- [ ] GPT-SoVITS cloned into `GPT-SoVITS/` (needed for Phase 3 only)
+
+**Data**
+- [ ] At least 30 audio clips ready (100+ recommended for quality results)
+- [ ] Each clip: 2–10 seconds, clean background, no music or reverb
+- [ ] `training_data/metadata_master.txt` exists with correct pipe-delimited format
+
+**Verify AI service works before fine-tuning**
+```bash
+# Start the base service
+python -m uvicorn main:app --host 127.0.0.1 --port 8000 --reload
+
+# Test in another terminal
+curl http://localhost:8000/
+# Should return: {"message": "MC Hub AI Service is running", "device": "cuda", ...}
+```
 
 ---
 
@@ -254,35 +288,155 @@ These are reference-only — not used in training unless added to `metadata_mast
   -> Run download_dataset.py first
 ```
 
-Create the file manually (see Phase 1 format) or run `fetch_samples.py` first.
+**Fix:** Create the file manually (see Phase 1 format) or run `python download_dataset.py` first.
+
+---
 
 ### GPT-SoVITS CUDA out of memory
 
-Reduce batch size to 2, or use `--fp16` flag if supported.
+**Symptom:** Training crashes with `CUDA out of memory` or `RuntimeError: CUDA error`.
+
+**Fixes (try in order):**
+1. Reduce batch size from 4 → 2 in WebUI settings
+2. Close other GPU processes (`nvidia-smi` to check VRAM usage)
+3. Set `max_audio_length = 10` (shorter clips use less VRAM per batch)
+4. Add `--fp16` flag if your GPT-SoVITS version supports it
+
+---
 
 ### Whisper transcription quality low on custom audio
 
-Switch `stt_model = whisper.load_model("medium")` in `main.py` for better accuracy on regional accents. Requires ~3 GB VRAM.
+**Symptom:** `accuracy_score` is very low (< 40) even when the recording sounds correct. Often caused by strong regional accents or uncommon vocabulary.
 
-### TTS output sounds robotic
+**Fix:** Switch to a larger Whisper model in `main.py`:
+```python
+# Line ~15 in main.py
+# Current (fast, good for standard speech):
+whisper_model = whisper.load_model("small")
 
-Increase training data (aim for 200+ clips). Ensure consistent recording conditions — same room, microphone distance, and vocal energy throughout.
+# Better accuracy for regional accents (requires ~3 GB VRAM):
+whisper_model = whisper.load_model("medium")
+
+# Best accuracy (requires ~6 GB VRAM — tight on RTX 4060):
+whisper_model = whisper.load_model("large")
+```
+
+Restart the server after changing the model. First startup will be slow as the model loads into VRAM.
+
+---
+
+### TTS output sounds robotic or unnatural
+
+**Symptom:** The generated voice from `/generate-mc-voice` sounds robotic, flat, or has wrong tones.
+
+**Root causes:**
+1. Too few training clips (< 50) — model lacks enough examples
+2. Inconsistent recording conditions — different microphone distances, room echo, or background noise between clips
+3. Under-trained — loss not converged (check console: `loss > 0.05` after epoch 10 means more epochs needed)
+
+**Fixes:**
+- Collect 100–200 clips with consistent conditions
+- Re-record any clips with audible background noise
+- Run 15–20 epochs instead of 10 if loss is still high
+
+---
+
+### Python `import whisper` fails
+
+**Symptom:** `ModuleNotFoundError: No module named 'whisper'` on startup.
+
+**Fix:**
+```bash
+pip install openai-whisper
+```
+
+Note: The package name is `openai-whisper`, not `whisper`. There is a different unrelated package named `whisper` on PyPI.
+
+---
+
+### `librosa` audio loading fails on Windows
+
+**Symptom:** `audioread.NoBackendError` or `RuntimeError: Error loading audio file`.
+
+**Cause:** FFmpeg is not installed or not in PATH.
+
+**Fix (Windows):**
+```powershell
+winget install ffmpeg
+# Close and reopen terminal
+ffmpeg -version    # verify
+```
+
+Alternatively, `static-ffmpeg` in `requirement.txt` handles this automatically for Python-level calls. If the error persists, install FFmpeg system-wide.
+
+---
+
+### GPT-SoVITS WebUI not accessible at port 9872
+
+**Symptom:** Browser shows "connection refused" when opening `http://127.0.0.1:9872`.
+
+**Cause:** WebUI failed to start — check terminal output for Python errors.
+
+**Common causes:**
+- `requirements.txt` not installed inside GPT-SoVITS virtualenv
+- Port 9872 already in use by another process
+
+**Fix:**
+```bash
+# Check if port is in use
+netstat -aon | findstr :9872
+
+# Run WebUI with a different port
+cd GPT-SoVITS
+python webui.py --port 9873
+```
+
+---
+
+### Training loss not decreasing
+
+**Symptom:** Console shows `loss=0.18` after epoch 5 and it's not going down.
+
+**Likely causes:**
+- Learning rate too high (reduce from default to `5e-6`)
+- Dataset too small (< 30 clips)
+- Clips are too long (> 15s) — model struggles with long sequences
+
+**Fix:** Preprocess again with stricter duration filter, then retrain from scratch.
+
+---
+
+## Performance Expectations
+
+| Training data | Epochs | Time (RTX 4060) | Output quality |
+|---|---|---|---|
+| 30–50 clips | 10 | ~10 min | Basic — recognizable voice, some artifacts |
+| 100 clips | 15 | ~25 min | Good — natural intonation, correct tones |
+| 200+ clips | 20 | ~50 min | Excellent — near-reference quality |
+
+More data always helps more than more epochs. If you have 200 clips, 15 epochs is better than 50 clips at 30 epochs.
 
 ---
 
 ## .gitignore Reference
 
-These paths are already excluded from the MC Hub repo:
+These paths are already excluded from the MC Hub repo. **Never commit these.**
 
 ```gitignore
-models/
-library/
-training_data/
-GPT-SoVITS/
+models/              # Trained model weights (can be several GB)
+library/             # Reference audio files
+training_data/       # Preprocessed training datasets
+GPT-SoVITS/          # External repo — clone separately
 __pycache__/
+venv/
 *.onnx
-*.ckpt
-*.pth
+*.ckpt               # GPT-SoVITS checkpoint weights
+*.pth                # PyTorch weight files
+*.bin                # HuggingFace model binary files
+*.safetensors        # HuggingFace safe tensor format
+*.wav                # Audio files
+*.mp3
+*.m4a
+mc_voice_output.wav  # TTS output file
+temp_*               # Temporary processing files
 ```
-
-Never commit trained model weights or audio datasets.
