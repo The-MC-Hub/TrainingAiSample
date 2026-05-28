@@ -1,0 +1,36 @@
+# MC Hub AI Service — Python dependencies
+# Cài đặt: pip install -r requirements.txt
+
+# Core API
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+
+# Environment
+python-dotenv>=1.0.0
+
+# AI / STT — CPU-only torch (nhẹ hơn ~1.5GB so với full torch)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.2.0+cpu
+torchaudio>=2.2.0+cpu
+transformers>=4.40.0
+
+# Audio analysis
+librosa>=0.10.2
+numpy>=1.26.0
+scipy>=1.13.0
+
+# Speech scoring
+jiwer>=3.0.4
+
+# TTS (Hugging Face models)
+huggingface_hub>=0.22.0
+accelerate>=0.29.0
+
+# Audio format support
+static-ffmpeg>=2.5
+
+# Multipart form upload
+python-multipart>=0.0.9
+
+# Whisper
+openai-whisper>=20231117

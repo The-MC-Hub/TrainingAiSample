@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: mc-voice-ai
+    runtime: python
+    region: oregon
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /
+    envVars:
+      - key: WHISPER_MODEL
+        value: small
+      - key: TTS_MODEL_PATH
+        value: ./models/mms-tts-vie
+      - key: ALLOWED_ORIGINS
+        value: https://mc-voice-training.vercel.app,http://localhost:5173
+      - key: PYTHON_VERSION
+        value: "3.11.0"
