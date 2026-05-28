@@ -10,8 +10,8 @@ python-dotenv>=1.0.0
 
 # AI / STT — CPU-only torch (nhẹ hơn ~1.5GB so với full torch)
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch>=2.2.0+cpu
-torchaudio>=2.2.0+cpu
+torch==2.2.0+cpu
+torchaudio==2.2.0+cpu
 transformers>=4.40.0
 
 # Audio analysis
