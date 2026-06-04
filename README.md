@@ -1,3 +1,12 @@
+---
+title: Voice AI Training
+emoji: 🎙️
+colorFrom: blue
+colorTo: purple
+sdk: docker
+pinned: false
+---
+
 # MC Hub AI Service
 
 > FastAPI voice analysis engine for the MC Voice Training platform. Transcribes recordings with Whisper, scores pronunciation accuracy, rhythm, and pacing, then returns bilingual (VI/EN) expert feedback.

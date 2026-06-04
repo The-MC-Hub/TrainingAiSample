@@ -8,11 +8,9 @@ uvicorn[standard]>=0.29.0
 # Environment
 python-dotenv>=1.0.0
 
-# AI / STT — CPU-only torch (nhẹ hơn ~1.5GB so với full torch)
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.1.2+cpu
-torchaudio==2.1.2+cpu
-transformers>=4.40.0
+# AI / STT
+torch>=2.1.0
+torchaudio>=2.1.0
 
 # Audio analysis
 librosa>=0.10.2
@@ -22,12 +20,12 @@ scipy>=1.13.0
 # Speech scoring
 jiwer>=3.0.4
 
-# TTS (Hugging Face models)
-huggingface_hub>=0.22.0
-accelerate>=0.29.0
+# TTS — Supertonic (replaces MMS-TTS-VIE)
+supertonic-py>=0.1.0
+soundfile>=0.12.1
 
-# Audio format support
-static-ffmpeg>=2.5
+# Hugging Face (used by openai-whisper for model download)
+huggingface_hub>=0.22.0
 
 # Multipart form upload
 python-multipart>=0.0.9

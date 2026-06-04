@@ -1,12 +1,14 @@
+# -*- coding: utf-8 -*-
+import sys, io as _io; sys.stdout = _io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 from fastapi import FastAPI, UploadFile, File, Form
+import io
+import soundfile as sf
 import shutil
 import os
 import uuid
 import whisper
 import jiwer
 import torch
-from transformers import VitsModel, AutoTokenizer
-import scipy.io.wavfile
 import numpy as np
 import librosa
 import json
@@ -81,30 +83,14 @@ def _choose_whisper_model(vram: float) -> str:
 _whisper_env = os.getenv("WHISPER_MODEL", "AUTO").strip()
 if _whisper_env.upper() == "AUTO":
     whisper_model_name = _choose_whisper_model(vram_gb)
-    print(f"[AI] WHISPER_MODEL=AUTO → selected '{whisper_model_name}' (VRAM={vram_gb:.1f}GB)")
+    print(f"[AI] WHISPER_MODEL=AUTO -> selected '{whisper_model_name}' (VRAM={vram_gb:.1f}GB)")
 else:
     whisper_model_name = _whisper_env
-    print(f"[AI] WHISPER_MODEL override from .env → '{whisper_model_name}'")
+    print(f"[AI] WHISPER_MODEL override from .env -> '{whisper_model_name}'")
 
 print(f"[AI] Loading STT model (Whisper {whisper_model_name})...")
 stt_model = whisper.load_model(whisper_model_name, device=device)
 print(f"[AI] Whisper {whisper_model_name} loaded on {device.upper()}")
-
-# ================================================================
-#  2. Load TTS Model — MMS-TTS Vietnamese
-# ================================================================
-TTS_MODEL_PATH = os.getenv("TTS_MODEL_PATH", "./models/mms-tts-vie")
-print("[AI] Checking TTS model...")
-tts_model = None
-tts_tokenizer = None
-
-if os.path.exists(TTS_MODEL_PATH):
-    print("[AI] Loading TTS model (MMS-TTS-VIE)...")
-    tts_tokenizer = AutoTokenizer.from_pretrained(TTS_MODEL_PATH)
-    tts_model = VitsModel.from_pretrained(TTS_MODEL_PATH).to(device)
-    print(f"[AI] TTS loaded on {device.upper()}")
-else:
-    print("[AI] TTS model not found. Run download_model.py first.")
 
 print("[AI] All models ready!")
 
@@ -117,7 +103,7 @@ def compute_pause_stats(audio_data: np.ndarray, sr: int) -> dict:
     hop_length   = int(0.010 * sr)
     rms = librosa.feature.rms(y=audio_data, frame_length=frame_length, hop_length=hop_length)[0]
 
-    silence_threshold = np.mean(rms) * 0.05
+    silence_threshold = float(np.percentile(rms, 10))
     is_silent = rms < silence_threshold
 
     pauses = []
@@ -189,17 +175,18 @@ def compute_pitch_stats(audio_data: np.ndarray, sr: int) -> dict:
 # ================================================================
 def compute_snr(audio_data: np.ndarray, sr: int) -> float:
     """
-    Estimate signal-to-noise ratio in dB.
-    Uses first 0.3s as noise floor estimate (assumes mic capture starts quiet).
-    Returns SNR dB — higher is cleaner. < 15 dB = noisy recording.
+    Estimate SNR using adaptive noise floor — percentile 5% of frame power.
+    More robust than fixed 0.3s window: works even when speaker starts immediately.
+    Returns SNR dB (0–60). < 15 dB = noisy recording.
     """
     try:
-        noise_samples = int(0.3 * sr)
-        if len(audio_data) < noise_samples * 2:
-            return 30.0  # too short to estimate, assume clean
+        hop = int(0.010 * sr)
+        frame = int(0.025 * sr)
+        rms = librosa.feature.rms(y=audio_data, frame_length=frame, hop_length=hop)[0]
+        power = rms ** 2
 
-        noise_floor = np.mean(audio_data[:noise_samples] ** 2)
-        signal_power = np.mean(audio_data[noise_samples:] ** 2)
+        noise_floor = float(np.percentile(power, 5))
+        signal_power = float(np.percentile(power, 75))
 
         if noise_floor <= 0 or signal_power <= 0:
             return 30.0
@@ -215,16 +202,19 @@ def compute_snr(audio_data: np.ndarray, sr: int) -> float:
 # ================================================================
 def compute_energy_profile(audio_data: np.ndarray, sr: int) -> dict:
     """
-    Detect if voice energy fades at end of sentences.
-    Split audio into 5 equal segments, compute RMS per segment.
-    fade_score: ratio of last-segment RMS vs max-segment RMS.
-    < 0.5 = noticeable fade (common issue for untrained MCs).
+    Detect vocal energy fade using 10 segments for finer resolution.
+    fade_score: last-segment RMS vs max-segment RMS.
+    mid_fade_score: average of segments 4-6 vs max (detects mid-passage drops).
+    < 0.5 = noticeable fade.
     """
     try:
-        n_segments = 5
+        n_segments = 10
         seg_len = len(audio_data) // n_segments
-        if seg_len < sr * 0.2:  # segment < 0.2s, too short
-            return {"fade_score": 1.0, "energy_segments": []}
+        if seg_len < sr * 0.1:  # segment < 0.1s, too short — fallback to 5
+            n_segments = 5
+            seg_len = len(audio_data) // n_segments
+        if seg_len < sr * 0.1:
+            return {"fade_score": 1.0, "mid_fade_score": 1.0, "energy_segments": []}
 
         rms_per_seg = []
         for i in range(n_segments):
@@ -234,12 +224,17 @@ def compute_energy_profile(audio_data: np.ndarray, sr: int) -> dict:
         max_rms = max(rms_per_seg) if max(rms_per_seg) > 0 else 1.0
         fade_score = rms_per_seg[-1] / max_rms
 
+        mid_start = n_segments // 4
+        mid_end   = n_segments * 3 // 4
+        mid_fade_score = float(np.mean(rms_per_seg[mid_start:mid_end])) / max_rms
+
         return {
-            "fade_score": round(fade_score, 3),
+            "fade_score":      round(fade_score, 3),
+            "mid_fade_score":  round(mid_fade_score, 3),
             "energy_segments": [round(v / max_rms, 3) for v in rms_per_seg],
         }
     except Exception:
-        return {"fade_score": 1.0, "energy_segments": []}
+        return {"fade_score": 1.0, "mid_fade_score": 1.0, "energy_segments": []}
 
 
 # ================================================================
@@ -262,6 +257,250 @@ def pitch_to_expressiveness_score(pitch_std_semitones: float) -> float:
     if pitch_std_semitones >= 1.0:
         return 25.0 + (pitch_std_semitones - 1.0) * 30.0
     return pitch_std_semitones * 25.0
+
+
+# ================================================================
+#  Helper: Compute composite emotion score (0-100)
+#  Combines 3 acoustic signals:
+#    - pitch_std   (F0 variation)   — weight 50%
+#    - energy_std  (RMS variation)  — weight 30%
+#    - tempo_var   (beat variation) — weight 20%
+# ================================================================
+def compute_emotion_score(audio_data: np.ndarray, sr: int, pitch_std_semitones: float) -> dict:
+    """
+    Composite emotion score from 3 acoustic features:
+      pitch_std_semitones : already computed upstream
+      energy_std_score    : RMS variation over 10-frame windows (0-100)
+      tempo_var_score     : beat interval std deviation (0-100)
+
+    Returns dict with composite score + breakdown for diagnostics.
+    """
+    # ── Component 1: pitch variation (already computed) ──
+    pitch_score = pitch_to_expressiveness_score(pitch_std_semitones)
+
+    # ── Component 2: energy (RMS) variation ──
+    try:
+        frame_len = int(0.025 * sr)
+        hop_len   = int(0.010 * sr)
+        rms = librosa.feature.rms(y=audio_data, frame_length=frame_len, hop_length=hop_len)[0]
+        energy_std_raw = float(np.std(rms))
+        # Normalize: raw std ~0.01–0.06 for expressive speech → map to 0-100
+        energy_std_score = float(np.clip(energy_std_raw * 1500.0, 0.0, 100.0))
+    except Exception:
+        energy_std_score = 0.0
+
+    # ── Component 3: tempo/beat variation ──
+    try:
+        tempo, beats = librosa.beat.beat_track(y=audio_data, sr=sr)
+        if len(beats) >= 4:
+            beat_intervals = np.diff(librosa.frames_to_time(beats, sr=sr))
+            tempo_var_raw = float(np.std(beat_intervals))
+            # Normalize: raw std ~0.05–0.3s → map to 0-100
+            tempo_var_score = float(np.clip(tempo_var_raw * 300.0, 0.0, 100.0))
+        else:
+            tempo_var_score = 0.0
+    except Exception:
+        tempo_var_score = 0.0
+
+    # ── Weighted composite ──
+    composite = (
+        pitch_score      * 0.50 +
+        energy_std_score * 0.30 +
+        tempo_var_score  * 0.20
+    )
+    composite = round(float(np.clip(composite, 0.0, 100.0)), 2)
+
+    return {
+        "emotion_score":      composite,
+        "pitch_score":        round(pitch_score, 2),
+        "energy_std_score":   round(energy_std_score, 2),
+        "tempo_var_score":    round(tempo_var_score, 2),
+    }
+
+
+# ================================================================
+#  Phase 2 — Spectral & MFCC features
+# ================================================================
+def compute_spectral_features(audio_data: np.ndarray, sr: int) -> dict:
+    """
+    Compute 3 spectral features relevant to MC voice quality:
+      spectral_centroid_mean_hz : brightness of voice (higher = brighter/clearer)
+      spectral_contrast_mean    : sharpness/definition between harmonic peaks and valleys
+      mfcc_stability_score      : consistency of articulation (0-100, higher = more consistent)
+    """
+    try:
+        hop = int(0.010 * sr)
+        frame = int(0.025 * sr)
+
+        # Spectral centroid — average frequency weighted by energy
+        centroid = librosa.feature.spectral_centroid(y=audio_data, sr=sr, hop_length=hop)[0]
+        centroid_mean = float(np.mean(centroid))
+
+        # Spectral contrast — difference between peaks and valleys per band
+        contrast = librosa.feature.spectral_contrast(y=audio_data, sr=sr, hop_length=hop)
+        contrast_mean = float(np.mean(contrast))
+
+        # MFCC stability — low std across time = consistent articulation
+        mfcc = librosa.feature.mfcc(y=audio_data, sr=sr, n_mfcc=13, hop_length=hop)
+        mfcc_std_per_coeff = np.std(mfcc, axis=1)
+        mfcc_instability = float(np.mean(mfcc_std_per_coeff))
+        # Map: instability ~5-25 typical → invert to 0-100 stability score
+        mfcc_stability_score = float(np.clip(100.0 - (mfcc_instability - 5.0) * 5.0, 0.0, 100.0))
+
+        return {
+            "spectral_centroid_hz":   round(centroid_mean, 1),
+            "spectral_contrast_mean": round(contrast_mean, 2),
+            "mfcc_stability_score":   round(mfcc_stability_score, 2),
+        }
+    except Exception as e:
+        print(f"[AI] Spectral features error: {e}")
+        return {"spectral_centroid_hz": 0.0, "spectral_contrast_mean": 0.0, "mfcc_stability_score": 0.0}
+
+
+def compute_pitch_contour(audio_data: np.ndarray, sr: int, f0_array) -> dict:
+    """
+    Analyse pitch contour shape: rising / falling / flat.
+    Uses linear regression slope on voiced F0 frames.
+    Positive slope = rising (question/excitement), negative = falling (statement/authority).
+    slope_semitones_per_sec:
+      > +0.5  → rising
+      < -0.5  → falling
+      else    → flat
+    """
+    try:
+        if f0_array is None or len(f0_array) < 10:
+            return {"pitch_slope": 0.0, "pitch_contour": "flat"}
+
+        hop = 512
+        times = librosa.frames_to_time(np.arange(len(f0_array)), sr=sr, hop_length=hop)
+        voiced_mask = f0_array > 0
+        if np.sum(voiced_mask) < 5:
+            return {"pitch_slope": 0.0, "pitch_contour": "flat"}
+
+        t_voiced = times[voiced_mask]
+        f0_voiced = f0_array[voiced_mask]
+        f0_semi = 12 * np.log2(f0_voiced / 440.0)
+
+        # Linear regression
+        t_norm = t_voiced - t_voiced[0]
+        slope = float(np.polyfit(t_norm, f0_semi, 1)[0])
+
+        if slope > 0.5:
+            contour = "rising"
+        elif slope < -0.5:
+            contour = "falling"
+        else:
+            contour = "flat"
+
+        return {"pitch_slope": round(slope, 3), "pitch_contour": contour}
+    except Exception:
+        return {"pitch_slope": 0.0, "pitch_contour": "flat"}
+
+
+def compute_jitter_shimmer_hnr(audio_data: np.ndarray, sr: int, f0_array, voiced_flag) -> dict:
+    """
+    Compute voice quality indicators from raw F0 and audio:
+      jitter_pct    : cycle-to-cycle F0 variation (%) — high = shaky/nervous voice
+                      Normal < 1.0%, Pathological > 3%
+      shimmer_pct   : cycle-to-cycle amplitude variation (%) — high = unsteady loudness
+                      Normal < 3.0%, Pathological > 6%
+      hnr_db        : Harmonic-to-Noise Ratio — quality of vocal fold vibration
+                      MC target > 15 dB. < 10 dB = hoarse/breathy.
+    All computed from voiced frames only.
+    """
+    try:
+        if f0_array is None or voiced_flag is None:
+            return {"jitter_pct": 0.0, "shimmer_pct": 0.0, "hnr_db": 0.0}
+
+        voiced_f0 = f0_array[voiced_flag & (f0_array > 0)]
+        if len(voiced_f0) < 10:
+            return {"jitter_pct": 0.0, "shimmer_pct": 0.0, "hnr_db": 0.0}
+
+        # Jitter: mean absolute difference of successive F0 periods / mean period
+        periods = 1.0 / voiced_f0
+        period_diffs = np.abs(np.diff(periods))
+        jitter_pct = float(np.mean(period_diffs) / np.mean(periods) * 100.0)
+        jitter_pct = round(float(np.clip(jitter_pct, 0.0, 20.0)), 3)
+
+        # Shimmer: mean absolute amplitude difference between successive voiced frames
+        hop = 512
+        frame_len = 2048
+        rms = librosa.feature.rms(y=audio_data, frame_length=frame_len, hop_length=hop)[0]
+        # Align rms length with f0_array (pyin uses same hop/frame)
+        min_len = min(len(rms), len(voiced_flag))
+        rms_voiced = rms[:min_len][voiced_flag[:min_len] & (f0_array[:min_len] > 0)]
+        if len(rms_voiced) > 2 and np.mean(rms_voiced) > 0:
+            amp_diffs = np.abs(np.diff(rms_voiced))
+            shimmer_pct = float(np.mean(amp_diffs) / np.mean(rms_voiced) * 100.0)
+            shimmer_pct = round(float(np.clip(shimmer_pct, 0.0, 30.0)), 3)
+        else:
+            shimmer_pct = 0.0
+
+        # HNR approximation via autocorrelation
+        # Use a voiced segment: find first voiced window of ~0.1s
+        hop_t = hop / sr
+        voiced_indices = np.where(voiced_flag[:min_len] & (f0_array[:min_len] > 0))[0]
+        if len(voiced_indices) > 0:
+            center_idx = voiced_indices[len(voiced_indices) // 2]
+            start_sample = int(center_idx * hop)
+            window_samples = int(0.1 * sr)
+            end_sample = min(start_sample + window_samples, len(audio_data))
+            segment = audio_data[start_sample:end_sample]
+            if len(segment) > 100:
+                autocorr = np.correlate(segment, segment, mode='full')
+                autocorr = autocorr[len(autocorr) // 2:]
+                r0 = autocorr[0]
+                f0_center = float(np.mean(voiced_f0[len(voiced_f0)//2 - 2 : len(voiced_f0)//2 + 2]))
+                lag = int(sr / max(f0_center, 80))
+                if 0 < lag < len(autocorr) and r0 > 0:
+                    r1 = autocorr[lag]
+                    ratio = np.clip(r1 / r0, 0.0001, 0.9999)
+                    hnr_db = round(float(10 * np.log10(ratio / (1 - ratio))), 1)
+                    hnr_db = float(np.clip(hnr_db, 0.0, 40.0))
+                else:
+                    hnr_db = 0.0
+            else:
+                hnr_db = 0.0
+        else:
+            hnr_db = 0.0
+
+        return {"jitter_pct": jitter_pct, "shimmer_pct": shimmer_pct, "hnr_db": hnr_db}
+    except Exception as e:
+        print(f"[AI] Jitter/Shimmer/HNR error: {e}")
+        return {"jitter_pct": 0.0, "shimmer_pct": 0.0, "hnr_db": 0.0}
+
+
+def detect_filler_words(text: str) -> dict:
+    """
+    Count filler words common in Vietnamese MC speech.
+    Returns count, list of found fillers, and score (100 = no fillers).
+    """
+    import re
+    fillers_vi = [
+        "ừm", "ừ", "à", "ờ", "ơ", "thì", "là", "mà", "nhé", "nha",
+        "cái", "đó là", "tức là", "như là", "thật ra", "thật sự",
+        "okay", "ok", "uh", "um", "er", "ah",
+    ]
+    text_lower = text.lower()
+    found = []
+    total = 0
+    for filler in fillers_vi:
+        pattern = r'\b' + re.escape(filler) + r'\b'
+        matches = re.findall(pattern, text_lower)
+        if matches:
+            found.append({"word": filler, "count": len(matches)})
+            total += len(matches)
+
+    word_count = max(1, len(text_lower.split()))
+    filler_ratio = total / word_count
+    filler_score = float(np.clip(100.0 - filler_ratio * 500.0, 0.0, 100.0))
+
+    return {
+        "filler_count":  total,
+        "filler_ratio":  round(filler_ratio, 4),
+        "filler_score":  round(filler_score, 2),
+        "fillers_found": found,
+    }
 
 
 # ================================================================
@@ -328,7 +567,7 @@ def compute_overall_score(criteria_scores: dict, criteria: list) -> float:
 #  Helper: Build bilingual expert tips and reports
 # ================================================================
 def generate_bilingual_evaluation(
-    expressiveness_score: float,  # pitch-based
+    expressiveness_score: float,  # composite emotion score
     onset_variation_score: float, # beat/stress
     pitch_stats: dict,
     pause_stats: dict,
@@ -342,6 +581,11 @@ def generate_bilingual_evaluation(
     criteria: list,
     criteria_scores: dict,
     overall_score: float,
+    emotion_data: dict = None,
+    spectral_features: dict = None,
+    pitch_contour: dict = None,
+    filler_data: dict = None,
+    voice_quality: dict = None,
 ) -> dict:
     avg_pause = pause_stats["avg_pause_sec"]
     pitch_std = pitch_stats["pitch_std_semitones"]
@@ -397,9 +641,36 @@ def generate_bilingual_evaluation(
     else:
         tips_vi.append({"label": "TỐC ĐỘ", "tip": f"Tốc độ nhanh ({wpm:.0f} WPM). Hãy nói chậm lại ở những đoạn quan trọng."})
 
-    # Pitch tip
+    # Pitch + emotion tips
     if pitch_std < PITCH_EXPRESSIVE_THRESHOLD:
         tips_vi.append({"label": "GIỌNG ĐIỆU", "tip": f"Biến thiên cao độ thấp ({pitch_std:.1f} semitone). Luyện đọc với cường độ cảm xúc tăng dần."})
+    if emotion_data:
+        if emotion_data.get("energy_std_score", 100) < 35:
+            tips_vi.append({"label": "NĂNG LƯỢNG", "tip": "Mức năng lượng giọng đều đều — thử tăng/giảm to nhỏ theo từng đoạn câu để tạo điểm nhấn."})
+        if emotion_data.get("tempo_var_score", 100) < 35:
+            tips_vi.append({"label": "NHỊP ĐỘ", "tip": "Nhịp nói quá đều — thử chậm lại ở câu quan trọng, nhanh hơn ở đoạn chuyển tiếp."})
+
+    # Phase 2 tips — spectral, pitch contour, filler words
+    if spectral_features:
+        if spectral_features.get("spectral_centroid_hz", 2000) < 1500:
+            tips_vi.append({"label": "ÂM SẮC", "tip": "Giọng hơi trầm tối — thử nhấc khẩu hình lên nhẹ và mỉm cười khi nói để làm sáng giọng."})
+        if spectral_features.get("mfcc_stability_score", 100) < 50:
+            tips_vi.append({"label": "NHẤT QUÁN", "tip": "Phát âm thiếu nhất quán giữa các câu — luyện đọc cùng một đoạn nhiều lần để ổn định khẩu hình."})
+
+    if pitch_contour and pitch_contour.get("pitch_contour") == "flat":
+        tips_vi.append({"label": "ĐƯỜNG CAO ĐỘ", "tip": "Câu nói thiếu hướng cao độ — thử kết thúc câu khẳng định bằng nốt xuống, câu hỏi bằng nốt lên."})
+
+    if filler_data and filler_data.get("filler_count", 0) >= 3:
+        filler_list = ", ".join(f['word'] for f in filler_data.get("fillers_found", [])[:3])
+        tips_vi.append({"label": "TỪ ĐỆM", "tip": f"Phát hiện {filler_data['filler_count']} từ đệm ({filler_list}...) — thay bằng khoảng lặng có chủ đích."})
+
+    if voice_quality:
+        if voice_quality.get("jitter_pct", 0) > 2.0:
+            tips_vi.append({"label": "ĐỘ RUN GIỌNG", "tip": f"Jitter cao ({voice_quality['jitter_pct']:.1f}%) — giọng run hoặc căng thẳng. Hít thở sâu, thư giãn cổ họng trước khi nói."})
+        if voice_quality.get("shimmer_pct", 0) > 5.0:
+            tips_vi.append({"label": "ỔN ĐỊNH ÂM LƯỢNG", "tip": f"Shimmer cao ({voice_quality['shimmer_pct']:.1f}%) — âm lượng không đều giữa các âm. Luyện hát thang âm giữ đều volume."})
+        if voice_quality.get("hnr_db", 20) < 10.0 and voice_quality.get("hnr_db", 0) > 0:
+            tips_vi.append({"label": "CHẤT GIỌNG", "tip": f"HNR thấp ({voice_quality['hnr_db']:.0f} dB) — giọng khàn/thở. Kiểm tra tình trạng thanh đới và uống nước trước khi tập."})
 
     # Per-criterion tips
     for aspect, score in criteria_scores.items():
@@ -451,6 +722,32 @@ def generate_bilingual_evaluation(
 
     if pitch_std < PITCH_EXPRESSIVE_THRESHOLD:
         tips_en.append({"label": "INTONATION", "tip": f"Pitch variation is low ({pitch_std:.1f} semitones). Practice reading with deliberate emotional intensity."})
+    if emotion_data:
+        if emotion_data.get("energy_std_score", 100) < 35:
+            tips_en.append({"label": "ENERGY", "tip": "Voice energy is flat — practice dynamic volume shifts to emphasize key phrases."})
+        if emotion_data.get("tempo_var_score", 100) < 35:
+            tips_en.append({"label": "TEMPO", "tip": "Speaking tempo is too steady — slow down on important sentences, speed up on transitions."})
+
+    if spectral_features:
+        if spectral_features.get("spectral_centroid_hz", 2000) < 1500:
+            tips_en.append({"label": "TIMBRE", "tip": "Voice sounds dark/heavy — try raising the soft palate and slight smile position to brighten tone."})
+        if spectral_features.get("mfcc_stability_score", 100) < 50:
+            tips_en.append({"label": "CONSISTENCY", "tip": "Articulation is inconsistent across sentences — drill the same passage repeatedly to stabilize mouth position."})
+
+    if pitch_contour and pitch_contour.get("pitch_contour") == "flat":
+        tips_en.append({"label": "PITCH DIRECTION", "tip": "Sentences lack pitch direction — end declarative sentences on a falling note, questions on a rising note."})
+
+    if filler_data and filler_data.get("filler_count", 0) >= 3:
+        filler_list = ", ".join(f['word'] for f in filler_data.get("fillers_found", [])[:3])
+        tips_en.append({"label": "FILLER WORDS", "tip": f"Detected {filler_data['filler_count']} filler words ({filler_list}...) — replace with deliberate pauses."})
+
+    if voice_quality:
+        if voice_quality.get("jitter_pct", 0) > 2.0:
+            tips_en.append({"label": "VOICE TREMOR", "tip": f"High jitter ({voice_quality['jitter_pct']:.1f}%) — voice is shaky or tense. Take deep breaths and relax throat before speaking."})
+        if voice_quality.get("shimmer_pct", 0) > 5.0:
+            tips_en.append({"label": "VOLUME STABILITY", "tip": f"High shimmer ({voice_quality['shimmer_pct']:.1f}%) — uneven amplitude between sounds. Practice sustained vowel exercises at steady volume."})
+        if voice_quality.get("hnr_db", 20) < 10.0 and voice_quality.get("hnr_db", 0) > 0:
+            tips_en.append({"label": "VOICE QUALITY", "tip": f"Low HNR ({voice_quality['hnr_db']:.0f} dB) — hoarse or breathy quality detected. Check vocal fold health and hydrate before practice."})
 
     for aspect, score in criteria_scores.items():
         if score < 60:
@@ -525,25 +822,43 @@ def generate_bilingual_evaluation(
     hint_line_vi = f"\n> 💡 **Lưu ý bài học:** {evaluation_hint}" if evaluation_hint else ""
     hint_line_en = f"\n> 💡 **Lesson Note:** {evaluation_hint}" if evaluation_hint else ""
 
+    newline = "\n"
+    default_rows_vi = (
+        f"| **Phát âm** | {accuracy_status_vi} | {accuracy_score:.1f}/100 | — |" + newline +
+        f"| **Giọng điệu** | {intonation_status_vi} | {expressiveness_score:.1f}/100 | — |" + newline +
+        f"| **Tốc độ** | {pace_status_vi} | {wpm:.0f} WPM | — |" + newline
+    )
+    default_rows_en = (
+        f"| **Pronunciation** | {accuracy_status_en} | {accuracy_score:.1f}/100 | — |" + newline +
+        f"| **Intonation** | {intonation_status_en} | {expressiveness_score:.1f}/100 | — |" + newline +
+        f"| **Pacing** | {pace_status_en} | {wpm:.0f} WPM | — |" + newline
+    )
+    actions_vi_str = "".join(a + newline for a in actions_vi)
+    actions_en_str = "".join(a + newline for a in actions_en)
+    pause_status_vi = "Hợp lý" if PAUSE_MIN_GOOD_SEC <= avg_pause <= PAUSE_MAX_GOOD_SEC else "Chưa ổn"
+    pause_status_en = "Optimal" if PAUSE_MIN_GOOD_SEC <= avg_pause <= PAUSE_MAX_GOOD_SEC else "Suboptimal"
+    rows_vi = criteria_rows_vi if criteria_rows_vi else default_rows_vi
+    rows_en = criteria_rows_en if criteria_rows_en else default_rows_en
+
     report_vi = f"""### 🎙️ Báo cáo Phân tích Chuyên sâu (AI Expert){hint_line_vi}
 **Đánh giá tổng thể:** Điểm tổng hợp **{overall_score:.1f}/100** · Độ chính xác phát âm **{accuracy_score:.1f}%**
 
 #### 📊 Điểm theo tiêu chí:
 | Tiêu chí | Trạng thái | Điểm | Trọng số |
 | :--- | :--- | :--- | :--- |
-{criteria_rows_vi if criteria_rows_vi else f"| **Phát âm** | {accuracy_status_vi} | {accuracy_score:.1f}/100 | — |\n| **Giọng điệu** | {intonation_status_vi} | {expressiveness_score:.1f}/100 | — |\n| **Tốc độ** | {pace_status_vi} | {wpm:.0f} WPM | — |\n"}
+{rows_vi}
 #### 📈 Phân tích kỹ thuật:
 | Tiêu chí | Trạng thái | Chỉ số thực tế | Mục tiêu |
 | :--- | :--- | :--- | :--- |
 | **Phát âm** | {accuracy_status_vi} | {accuracy_score:.1f}% | > 90% |
 | **Tốc độ** | {pace_status_vi} | {wpm:.0f} WPM | {target_wpm_min}–{target_wpm_max} WPM |
 | **Giọng điệu (F0)** | {intonation_status_vi} | {pitch_std:.2f} semitone | ≥ 2.0 semitone |
-| **Ngắt nghỉ** | {"Hợp lý" if PAUSE_MIN_GOOD_SEC <= avg_pause <= PAUSE_MAX_GOOD_SEC else "Chưa ổn"} | {avg_pause}s avg | {PAUSE_MIN_GOOD_SEC}s–{PAUSE_MAX_GOOD_SEC}s |
+| **Ngắt nghỉ** | {pause_status_vi} | {avg_pause}s avg | {PAUSE_MIN_GOOD_SEC}s–{PAUSE_MAX_GOOD_SEC}s |
 | **Năng lượng cuối** | {fade_status_vi} | {fade_score:.0%} | ≥ {ENERGY_FADE_WARN_THRESHOLD:.0%} |
 | **Chất lượng âm** | {noise_status_vi} | SNR {snr_db:.0f} dB | ≥ {SNR_NOISE_THRESHOLD_DB + 5:.0f} dB |
 
 #### 💡 Hành động cải thiện:
-{"".join([f"{a}\n" for a in actions_vi])}""".strip()
+{actions_vi_str}""".strip()
 
     report_en = f"""### 🎙️ Advanced AI Performance Report{hint_line_en}
 **Overall Score:** **{overall_score:.1f}/100** · Pronunciation Accuracy **{accuracy_score:.1f}%**
@@ -551,19 +866,19 @@ def generate_bilingual_evaluation(
 #### 📊 Per-Criterion Scores:
 | Criterion | Status | Score | Weight |
 | :--- | :--- | :--- | :--- |
-{criteria_rows_en if criteria_rows_en else f"| **Pronunciation** | {accuracy_status_en} | {accuracy_score:.1f}/100 | — |\n| **Intonation** | {intonation_status_en} | {expressiveness_score:.1f}/100 | — |\n| **Pacing** | {pace_status_en} | {wpm:.0f} WPM | — |\n"}
+{rows_en}
 #### 📈 Technical Analysis:
 | Metric | Status | Actual Value | MC Standard |
 | :--- | :--- | :--- | :--- |
 | **Articulation** | {accuracy_status_en} | {accuracy_score:.1f}% | > 90% |
 | **Pacing** | {pace_status_en} | {wpm:.0f} WPM | {target_wpm_min}–{target_wpm_max} WPM |
 | **Intonation (F0)** | {intonation_status_en} | {pitch_std:.2f} semitones | ≥ 2.0 semitones |
-| **Pausing** | {"Optimal" if PAUSE_MIN_GOOD_SEC <= avg_pause <= PAUSE_MAX_GOOD_SEC else "Suboptimal"} | {avg_pause}s avg | {PAUSE_MIN_GOOD_SEC}s–{PAUSE_MAX_GOOD_SEC}s |
+| **Pausing** | {pause_status_en} | {avg_pause}s avg | {PAUSE_MIN_GOOD_SEC}s–{PAUSE_MAX_GOOD_SEC}s |
 | **Energy Sustain** | {fade_status_en} | {fade_score:.0%} | ≥ {ENERGY_FADE_WARN_THRESHOLD:.0%} |
 | **Audio Quality** | {noise_status_en} | SNR {snr_db:.0f} dB | ≥ {SNR_NOISE_THRESHOLD_DB + 5:.0f} dB |
 
 #### 💡 Improvement Plan:
-{"".join([f"{a}\n" for a in actions_en])}""".strip()
+{actions_en_str}""".strip()
 
     return {
         "feedback_vi": " | ".join(feedback_vi),
@@ -602,8 +917,8 @@ async def analyze_voice(
     with open(temp_filename, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    print(f"[AI] Received: {file.filename!r} → {temp_filename} ({os.path.getsize(temp_filename)} bytes)")
-    print(f"[AI] WPM target: {target_wpm_min}–{target_wpm_max} | criteria: {len(criteria)} items")
+    print(f"[AI] Received: {file.filename!r} -> {temp_filename} ({os.path.getsize(temp_filename)} bytes)")
+    print(f"[AI] WPM target: {target_wpm_min}-{target_wpm_max} | criteria: {len(criteria)} items")
 
     try:
         # ── Stage 1: STT (Whisper) ──
@@ -626,7 +941,9 @@ async def analyze_voice(
 
         # ── Stage 4: Core metrics ──
         error_rate     = jiwer.wer(script_origin.lower(), text_spoken.lower())
-        accuracy_score = max(0.0, 100.0 - (error_rate * 100.0))
+        cer_rate       = jiwer.cer(script_origin.lower(), text_spoken.lower())
+        # Weighted accuracy: WER captures omitted/added words; CER captures mispronunciation
+        accuracy_score = max(0.0, 100.0 - (error_rate * 70.0 + cer_rate * 30.0))
         wpm            = (word_count / duration_speech) * 60.0  # speech-only duration
 
         # Onset strength variation (beat/stress energy — kept as RHYTHM dimension)
@@ -634,9 +951,10 @@ async def analyze_voice(
         onset_variation_raw = float(np.std(onset_env))
         onset_variation_score = min(100.0, onset_variation_raw * 20.0)
 
-        # ── Stage 5: Pitch (F0) analysis — intonation expressiveness ──
-        pitch_stats         = compute_pitch_stats(audio_data, sr)
-        expressiveness_score = pitch_to_expressiveness_score(pitch_stats["pitch_std_semitones"])
+        # ── Stage 5: Pitch (F0) + composite emotion analysis ──
+        pitch_stats      = compute_pitch_stats(audio_data, sr)
+        emotion_data     = compute_emotion_score(audio_data, sr, pitch_stats["pitch_std_semitones"])
+        expressiveness_score = emotion_data["emotion_score"]
 
         # ── Stage 6: SNR — noise quality ──
         snr_db = compute_snr(audio_data, sr)
@@ -644,9 +962,29 @@ async def analyze_voice(
         # ── Stage 7: Energy profile — fade detection ──
         energy_profile = compute_energy_profile(audio_data, sr)
 
-        print(f"[AI] accuracy={accuracy_score:.1f}% | wpm={wpm:.0f} | pitch_std={pitch_stats['pitch_std_semitones']:.2f}st | "
-              f"expressiveness={expressiveness_score:.1f} | onset_var={onset_variation_score:.1f} | "
-              f"snr={snr_db:.1f}dB | fade={energy_profile['fade_score']:.2f}")
+        # ── Stage 7b: Phase 2+3 — spectral, pitch contour, filler, jitter/shimmer/HNR ──
+        spectral_features = compute_spectral_features(audio_data, sr)
+        f0_raw, voiced_flag_raw, _ = librosa.pyin(
+            audio_data,
+            fmin=librosa.note_to_hz("C2"),
+            fmax=librosa.note_to_hz("C7"),
+            sr=sr, frame_length=2048, hop_length=512,
+        )
+        pitch_contour   = compute_pitch_contour(audio_data, sr, f0_raw)
+        filler_data     = detect_filler_words(text_spoken)
+        voice_quality   = compute_jitter_shimmer_hnr(audio_data, sr, f0_raw, voiced_flag_raw)
+
+        print(f"[AI] accuracy={accuracy_score:.1f}% (wer={error_rate:.2f} cer={cer_rate:.2f}) | wpm={wpm:.0f} | "
+              f"pitch_std={pitch_stats['pitch_std_semitones']:.2f}st contour={pitch_contour['pitch_contour']} | "
+              f"emotion={expressiveness_score:.1f} (pitch={emotion_data['pitch_score']:.1f} "
+              f"energy={emotion_data['energy_std_score']:.1f} tempo={emotion_data['tempo_var_score']:.1f}) | "
+              f"spectral_centroid={spectral_features['spectral_centroid_hz']:.0f}Hz "
+              f"mfcc_stability={spectral_features['mfcc_stability_score']:.1f} | "
+              f"jitter={voice_quality['jitter_pct']:.2f}% shimmer={voice_quality['shimmer_pct']:.2f}% "
+              f"hnr={voice_quality['hnr_db']:.1f}dB | "
+              f"onset_var={onset_variation_score:.1f} | snr={snr_db:.1f}dB | "
+              f"fade={energy_profile['fade_score']:.2f} mid={energy_profile['mid_fade_score']:.2f} | "
+              f"fillers={filler_data['filler_count']}")
 
         # ── Stage 8: Per-criterion scoring ──
         criteria_scores = compute_criteria_scores(
@@ -662,6 +1000,11 @@ async def analyze_voice(
             wpm, accuracy_score,
             target_wpm_min, target_wpm_max,
             evaluation_hint or "", criteria, criteria_scores, overall_score,
+            emotion_data=emotion_data,
+            spectral_features=spectral_features,
+            pitch_contour=pitch_contour,
+            filler_data=filler_data,
+            voice_quality=voice_quality,
         )
 
         return {
@@ -677,6 +1020,13 @@ async def analyze_voice(
             "energy_profile":    energy_profile,
             "snr_db":            snr_db,
             "onset_variation":   float(round(onset_variation_score, 2)),
+            "emotion_breakdown": emotion_data,
+            "cer_rate":          float(round(cer_rate, 4)),
+            "wer_rate":          float(round(error_rate, 4)),
+            "spectral_features": spectral_features,
+            "pitch_contour":     pitch_contour,
+            "filler_words":      filler_data,
+            "voice_quality":     voice_quality,
             # Bilingual fields
             "feedback":    eval_data["feedback_vi"],  # legacy
             "feedback_vi": eval_data["feedback_vi"],
@@ -712,37 +1062,6 @@ async def analyze_voice(
             os.remove(temp_filename)
 
 
-# ================================================================
-#  API: Generate MC Voice (TTS)
-# ================================================================
-@app.post("/generate-mc-voice")
-async def generate_mc_voice(text: str = Form(...)):
-    if tts_model is None or tts_tokenizer is None:
-        return {"status": "error", "message": "TTS model not loaded. Check ./models/mms-tts-vie"}
-
-    try:
-        inputs = tts_tokenizer(text, return_tensors="pt")
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-
-        with torch.no_grad():
-            with torch.cuda.amp.autocast(enabled=(device == "cuda")):
-                output = tts_model(**inputs).waveform
-
-        output_filename = "mc_voice_output.wav"
-        scipy.io.wavfile.write(
-            output_filename,
-            rate=tts_model.config.sampling_rate,
-            data=output.cpu().numpy().T,
-        )
-
-        return {
-            "status": "success",
-            "message": "MC voice generated successfully",
-            "file_path": output_filename,
-        }
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
 
 # ================================================================
 #  Health Check
@@ -754,7 +1073,6 @@ def read_root():
         "device":        device,
         "gpu":           torch.cuda.get_device_name(0) if device == "cuda" else "N/A",
         "whisper_model": whisper_model_name,
-        "tts_loaded":    tts_model is not None,
     }
 
 
@@ -767,7 +1085,7 @@ if __name__ == "__main__":
         "main:app",
         host="127.0.0.1",
         port=8001,
-        reload=True,
+        reload=False,
         loop="asyncio",
         log_level="info",
     )
