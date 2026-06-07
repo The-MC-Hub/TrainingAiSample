@@ -12,7 +12,12 @@ import torch
 import numpy as np
 import librosa
 import json
-from typing import Optional
+import logging
+import threading
+import requests
+from collections import deque
+from datetime import datetime, timezone
+from typing import Optional, List
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
@@ -1061,6 +1066,61 @@ async def analyze_voice(
         if os.path.exists(temp_filename):
             os.remove(temp_filename)
 
+
+
+# ================================================================
+#  Logging — in-memory buffer + push to Java backend
+# ================================================================
+
+_JAVA_INGEST_URL = os.getenv("JAVA_LOG_INGEST_URL", "http://localhost:5000/api/v1/admin/logs/ingest")
+_JAVA_LOG_TOKEN  = os.getenv("JAVA_ADMIN_TOKEN", "")  # optional bearer token
+
+_log_buffer: deque = deque(maxlen=500)
+
+class _BufferHandler(logging.Handler):
+    def emit(self, record: logging.LogRecord):
+        entry = {
+            "level":   record.levelname,
+            "logger":  record.name,
+            "message": self.format(record),
+            "source":  "AI",
+            "thread":  record.threadName,
+            "timestamp": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+        }
+        _log_buffer.append(entry)
+        # Push to Java backend asynchronously (fire-and-forget)
+        if _JAVA_INGEST_URL:
+            threading.Thread(target=_push_to_java, args=(entry,), daemon=True).start()
+
+def _push_to_java(entry: dict):
+    try:
+        headers = {"Content-Type": "application/json"}
+        if _JAVA_LOG_TOKEN:
+            headers["Authorization"] = f"Bearer {_JAVA_LOG_TOKEN}"
+        requests.post(_JAVA_INGEST_URL, json=entry, headers=headers, timeout=2)
+    except Exception:
+        pass  # never let logging break the AI service
+
+_buf_handler = _BufferHandler()
+_buf_handler.setFormatter(logging.Formatter("%(message)s"))
+
+_ai_logger = logging.getLogger("mchub.ai")
+_ai_logger.setLevel(logging.DEBUG)
+_ai_logger.addHandler(_buf_handler)
+
+# Also capture uvicorn access logs
+for _uvicorn_logger_name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
+    _ul = logging.getLogger(_uvicorn_logger_name)
+    _ul.addHandler(_buf_handler)
+
+
+@app.get("/logs")
+def get_logs(level: str = None, limit: int = 200):
+    """Return buffered AI service logs (last N entries). No auth required — only called internally by Java backend."""
+    logs = list(_log_buffer)
+    if level:
+        logs = [l for l in logs if l["level"] == level.upper()]
+    return {"logs": logs[-limit:]}
 
 
 # ================================================================
