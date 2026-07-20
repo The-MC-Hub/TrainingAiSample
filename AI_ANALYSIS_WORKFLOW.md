@@ -708,6 +708,8 @@ overall = (100×30 + 1×30 + 0×20 + 7.6×20) / 100 = 32.52
 
 ## 15. Module TTS — Tổng Hợp Giọng Nói MC (Supertonic)
 
+> **⚠️ Trạng thái thật (kiểm tra lại `main.py` ngày 2026-07-20):** endpoint `/generate-mc-voice` mô tả dưới đây **hiện KHÔNG tồn tại** trong `main.py` của repo này — `main.py` hiện chỉ có 3 route: `POST /analyze-voice`, `GET /logs`, `GET /`. `requirements.txt` đã đổi sang `supertonic-py`+`soundfile` (bỏ `transformers`/`accelerate`), xác nhận đang giữa quá trình chuyển engine, nhưng route TTS chưa được viết lại/gắn vào `main.py` sau khi đổi dependency. Bản TTS còn hoạt động (dùng MMS-TTS-VIE cũ, chưa nâng cấp Supertonic) nằm ở repo `HF-Space-Deploy` (production). Đừng chạy lệnh `curl .../generate-mc-voice` bên dưới với `main.py` của repo này và mong nó hoạt động — mục này mô tả trạng thái ĐÍCH sau khi hoàn tất migration, không phải trạng thái hiện tại.
+
 ### Tổng quan
 
 Module TTS (Text-to-Speech) cho phép hệ thống tổng hợp giọng nói MC chuyên nghiệp từ văn bản kịch bản. Từ phiên bản này, engine được nâng cấp từ **Facebook MMS-TTS-VIE** sang **Supertonic** — engine on-device ONNX tốc độ cao, output 44.1kHz.

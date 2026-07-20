@@ -3,6 +3,8 @@
 > Hướng dẫn huấn luyện giọng nói MC tiêu chuẩn từ dữ liệu thực.  
 > Target hardware: RTX 4060 8GB / Windows 11. Training time: ~30 min per epoch.  
 > **Last updated:** 2026-05-22
+>
+> **Chưa đồng bộ với script CLI mới:** guide này mô tả luồng GPT-SoVITS WebUI thủ công (Phase 3). Repo hiện có thêm 3 script chưa được nhắc ở đây: `finetune_whisper.py` (fine-tune Whisper trên tập STT), `launch_sovits_training.py` (pre-flight launcher cho WebUI, thay `python webui.py` thủ công), `run_sovits_training.py` (pipeline CLI headless, thay thế WebUI hoàn toàn). Nếu 3 script này là cách chính thức hiện dùng, Phase 3 dưới đây cần viết lại theo chúng thay vì hướng dẫn WebUI tay.
 
 ---
 
@@ -44,7 +46,7 @@ curl http://localhost:8000/
 ```
 Raw MC audio files
         ↓
-  python fetch_samples.py       ← download reference audio from HuggingFace
+  python download_dataset.py       ← download reference audio from HuggingFace
         ↓
   python preprocess_audio.py    ← validate, resample, normalize, split
         ↓
@@ -93,7 +95,7 @@ ffmpeg -version
 ### Option A: Download from HuggingFace datasets
 
 ```bash
-python fetch_samples.py
+python download_dataset.py
 ```
 
 Downloads sample audio to `library/`:
